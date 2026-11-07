@@ -1,0 +1,104 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: "Address of your deployed Nebula, for example https://my-nebula.vercel.app"
+        required: true
+      version_code:
+        description: "Version number. Raise it for every update you install over the previous one."
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the inputs
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          echo "$APP_URL" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$' || { echo "Use only the site address, like https://my-nebula.vercel.app"; exit 1; }
+          echo "$VERSION_CODE" | grep -Eq '^[0-9]{1,9}$' || { echo "The version must be a whole number"; exit 1; }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Pick the signing key
+        id: key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            mkdir -p "$RUNNER_TEMP/ks"
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks/nebula.jks"
+            {
+              echo "KEYSTORE_PATH=$RUNNER_TEMP/ks/nebula.jks"
+              echo "KEYSTORE_PASSWORD=$KS_PASS"
+              echo "KEY_ALIAS=$KS_ALIAS"
+              echo "KEY_PASSWORD=${KS_KEYPASS:-$KS_PASS}"
+            } >> "$GITHUB_ENV"
+            echo "mode=secret" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=cache" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore the generated key
+        if: steps.key.outputs.mode == 'cache'
+        uses: actions/cache@v4
+        with:
+          path: ~/nebula-ks
+          key: nebula-keystore-v1
+
+      - name: Create a signing key (first run only)
+        if: steps.key.outputs.mode == 'cache'
+        run: |
+          mkdir -p ~/nebula-ks
+          if [ ! -f ~/nebula-ks/nebula.jks ]; then
+            PW="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore ~/nebula-ks/nebula.jks -storepass "$PW" -keypass "$PW" \
+              -alias nebula -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Nebula, O=Nebula, C=US"
+            echo "$PW" > ~/nebula-ks/pw.txt
+          fi
+          PW="$(cat ~/nebula-ks/pw.txt)"
+          echo "::add-mask::$PW"
+          {
+            echo "KEYSTORE_PATH=$HOME/nebula-ks/nebula.jks"
+            echo "KEYSTORE_PASSWORD=$PW"
+            echo "KEY_ALIAS=nebula"
+            echo "KEY_PASSWORD=$PW"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the signed APK
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: gradle -p android assembleRelease --no-daemon -PappUrl="$APP_URL" -PversionCode="$VERSION_CODE" -PversionName="1.0.$VERSION_CODE"
+
+      - name: Show the signing certificate
+        run: |
+          TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          "$TOOLS/apksigner" verify --print-certs android/app/build/outputs/apk/release/app-release.apk | head -4 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nebula-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
